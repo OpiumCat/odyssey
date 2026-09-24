@@ -2905,14 +2905,23 @@ static inline void cancel_finished(od_global_t *global, od_instance_t *instance)
 	}
 }
 
-void od_frontend(void *arg)
+static void od_frontend_cleanup_client(od_client_t *client)
 {
-	od_client_t *client = arg;
 	od_global_t *global = client->global;
 	od_instance_t *instance = global->instance;
 	od_router_t *router = global->router;
-	od_extension_t *extensions = global->extensions;
-	od_module_t *modules = extensions->modules;
+
+	if (client->route != NULL) {
+		od_router_unroute(router, client);
+	}
+	od_instance_clients_remove(instance, client);
+	od_frontend_close(client);
+}
+
+static int od_frontend_client_io_attach(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
 
 	od_getpeername(client->io.io, client->peer, OD_CLIENT_MAX_PEERLEN, 1,
 		       1);
@@ -2932,63 +2941,65 @@ void od_frontend(void *arg)
 		od_io_close(&client->io);
 		od_client_free(client);
 		od_routing_slot_release(global);
-		return;
+		return rc;
 	}
 
-	/* handle startup */
-	rc = od_frontend_startup(client);
-	if (rc == -1) {
+	return 0;
+}
+
+static int od_frontend_cancel(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
+	od_router_t *router = global->router;
+
+	od_debug(&instance->logger, "startup", client, NULL, "cancel request");
+
+	od_routing_slot_release(global);
+
+	uint32_t queue_timeout =
+		instance->config.cancel_queue_timeout_ms >= 0 ?
+			(uint32_t)instance->config.cancel_queue_timeout_ms :
+			2 * (uint32_t)instance->config.cancel_timeout_ms;
+
+	int rc;
+	rc = wait_cancel_allowed(global, instance, queue_timeout);
+	if (rc != 0) {
+		od_error(&instance->logger, "startup", client, NULL,
+			 "dropping cancel request due to queue timeout %u ms",
+			 queue_timeout);
 		od_frontend_close(client);
-		od_routing_slot_release(global);
-		return;
+		return rc;
 	}
 
-	/* handle cancel request */
-	if (client->startup.is_cancel) {
-		od_debug(&instance->logger, "startup", client, NULL,
-			 "cancel request");
+	od_router_cancel_t cancel;
+	od_router_cancel_init(&cancel);
+	od_route_t *srv_route = NULL;
+	rc = od_router_cancel(router, &client->startup.key, &cancel,
+			      &srv_route);
+	if (rc == 0) {
+		od_stat_cancel(&srv_route->stats);
 
-		od_routing_slot_release(global);
+		od_cancel(client->global, cancel.storage, cancel.address,
+			  &cancel.key, &cancel.id);
 
-		uint32_t queue_timeout =
-			instance->config.cancel_queue_timeout_ms >= 0 ?
-				(uint32_t)instance->config
-					.cancel_queue_timeout_ms :
-				2 * (uint32_t)instance->config.cancel_timeout_ms;
+		od_route_lock(srv_route);
+		od_route_signal_locked(srv_route, NULL);
+		od_route_unlock(srv_route);
 
-		rc = wait_cancel_allowed(global, instance, queue_timeout);
-		if (rc != 0) {
-			od_error(
-				&instance->logger, "startup", client, NULL,
-				"dropping cancel request due to queue timeout %u ms",
-				queue_timeout);
-			od_frontend_close(client);
-			return;
-		}
-
-		od_router_cancel_t cancel;
-		od_router_cancel_init(&cancel);
-		od_route_t *srv_route = NULL;
-		rc = od_router_cancel(router, &client->startup.key, &cancel,
-				      &srv_route);
-		if (rc == 0) {
-			od_stat_cancel(&srv_route->stats);
-
-			od_cancel(client->global, cancel.storage,
-				  cancel.address, &cancel.key, &cancel.id);
-
-			od_route_lock(srv_route);
-			od_route_signal_locked(srv_route, NULL);
-			od_route_unlock(srv_route);
-
-			od_router_cancel_free(&cancel);
-		}
-
-		cancel_finished(global, instance);
-
-		od_frontend_close(client);
-		return;
+		od_router_cancel_free(&cancel);
 	}
+
+	cancel_finished(global, instance);
+
+	od_frontend_close(client);
+	return 0;
+}
+
+static int od_frontend_register(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
 
 	/* Use client id as backend key for the client.
 	 *
@@ -3001,12 +3012,22 @@ void od_frontend(void *arg)
 	client->key.key_pid = client->id.id_a;
 	client->key.key = client->id.id_b;
 
+	int rc;
 	rc = od_instance_clients_add(instance, client);
 	if (rc == -1) {
 		od_frontend_close(client);
 		od_routing_slot_release(global);
-		return;
+		return rc;
 	}
+
+	return 0;
+}
+
+static int od_frontend_route(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
+	od_router_t *router = global->router;
 
 	/* route client */
 	od_router_status_t router_status;
@@ -3022,9 +3043,11 @@ void od_frontend(void *arg)
 		}
 
 		/* override clients pg options if configured */
+		int rc;
 		rc = kiwi_vars_override(&client->vars, &route->rule->vars);
 		if (rc == -1) {
-			goto cleanup;
+			od_frontend_cleanup_client(client);
+			return rc;
 		}
 
 		/* set network options */
@@ -3123,10 +3146,18 @@ void od_frontend(void *arg)
 			break;
 		}
 
-		od_instance_clients_remove(instance, client);
-		od_frontend_close(client);
-		return;
+		od_frontend_cleanup_client(client);
+		return -1;
 	}
+
+	return 0;
+}
+
+int od_frontend_pre_auth(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_extension_t *extensions = global->extensions;
+	od_module_t *modules = extensions->modules;
 
 	/* pre-auth callback */
 	od_list_t *i;
@@ -3135,11 +3166,23 @@ void od_frontend(void *arg)
 		module = od_container_of(i, od_module_t, link);
 		if (module->auth_attempt_cb(client) ==
 		    OD_MODULE_CB_FAIL_RETCODE) {
-			goto cleanup;
+			od_frontend_cleanup_client(client);
+			return -1;
 		}
 	}
 
+	return 0;
+}
+
+int od_frontend_auth(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
+	od_extension_t *extensions = global->extensions;
+	od_module_t *modules = extensions->modules;
+
 	/* HBA check */
+	int rc;
 	rc = od_hba_process(client);
 
 	char client_ip[64];
@@ -3205,6 +3248,7 @@ void od_frontend(void *arg)
 		rc = NOT_OK_RESPONSE;
 	}
 
+	od_list_t *i;
 	if (rc != OK_RESPONSE) {
 		/* rc == -1
 		 * here we ignore module retcode because auth already failed
@@ -3215,7 +3259,8 @@ void od_frontend(void *arg)
 			module = od_container_of(i, od_module_t, link);
 			module->auth_complete_cb(client, rc);
 		}
-		goto cleanup;
+		od_frontend_cleanup_client(client);
+		return -1;
 	}
 
 	/* auth result callback */
@@ -3225,9 +3270,20 @@ void od_frontend(void *arg)
 		rc = module->auth_complete_cb(client, rc);
 		if (rc != OD_MODULE_CB_OK_RETCODE) {
 			/* user blocked from module callback */
-			goto cleanup;
+			od_frontend_cleanup_client(client);
+			return -1;
 		}
 	}
+
+	return 0;
+}
+
+int od_frontend_run(od_client_t *client)
+{
+	od_global_t *global = client->global;
+	od_router_t *router = global->router;
+	od_extension_t *extensions = global->extensions;
+	od_module_t *modules = extensions->modules;
 
 	/* setup client and run main loop */
 	od_route_t *route = client->route;
@@ -3259,20 +3315,62 @@ void od_frontend(void *arg)
 
 	od_frontend_cleanup(client, "main", status, l);
 
+	od_list_t *i;
 	od_list_foreach (&modules->link, i) {
 		od_module_t *module;
 		module = od_container_of(i, od_module_t, link);
 		module->disconnect_cb(client, status);
 	}
 
-	/* cleanup */
+	return 0;
+}
 
-cleanup:
-	/* detach client from its route */
-	od_router_unroute(router, client);
+void od_frontend(void *arg)
+{
+	od_client_t *client = arg;
+	od_global_t *global = client->global;
 
-	od_instance_clients_remove(instance, client);
+	int rc;
+	rc = od_frontend_client_io_attach(client);
+	if (rc == -1) {
+		return;
+	}
 
-	/* close frontend connection */
-	od_frontend_close(client);
+	/* handle startup */
+	rc = od_frontend_startup(client);
+	if (rc == -1) {
+		od_frontend_close(client);
+		od_routing_slot_release(global);
+		return;
+	}
+
+	/* handle cancel request */
+	if (client->startup.is_cancel) {
+		od_frontend_cancel(client);
+		return;
+	}
+
+	rc = od_frontend_register(client);
+	if (rc == -1) {
+		return;
+	}
+
+	rc = od_frontend_route(client);
+	if (rc == -1) {
+		return;
+	}
+
+	rc = od_frontend_pre_auth(client);
+	if (rc == -1) {
+		return;
+	}
+
+	rc = od_frontend_auth(client);
+	if (rc == -1) {
+		return;
+	}
+
+	od_frontend_run(client);
+
+	od_frontend_cleanup_client(client);
 }
